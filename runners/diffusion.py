@@ -17,6 +17,7 @@ from functions.ckpt_util import get_ckpt_path
 
 import torchvision.utils as tvu
 
+from ple.model import PermutationInvariantHyperNetwork
 
 def torch2hwcuint8(x, clip=False):
     if clip:
@@ -106,22 +107,30 @@ class Diffusion(object):
             num_workers=config.data.num_workers,
         )
         model = Model(config)
-
         model = model.to(self.device)
-        model = torch.nn.DataParallel(model)
 
-        optimizer = get_optimizer(self.config, model.parameters())
+        hyper_net = PermutationInvariantHyperNetwork(
+            dataset.dataset_size,
+            [32, 64, 96],
+            model,
+            use_outer_net=0,
+        ).to(self.device)
+
+        model = torch.nn.DataParallel(model)
+        hyper_net = torch.nn.DataParallel(hyper_net)
+
+        optimizer = get_optimizer(self.config, hyper_net.parameters())
 
         if self.config.model.ema:
             ema_helper = EMAHelper(mu=self.config.model.ema_rate)
-            ema_helper.register(model)
+            ema_helper.register(hyper_net)
         else:
             ema_helper = None
 
         start_epoch, step = 0, 0
         if self.args.resume_training:
             states = torch.load(os.path.join(self.args.log_path, "ckpt.pth"))
-            model.load_state_dict(states[0])
+            hyper_net.load_state_dict(states[0])
 
             states[1]["param_groups"][0]["eps"] = self.config.optim.eps
             optimizer.load_state_dict(states[1])
@@ -136,7 +145,7 @@ class Diffusion(object):
             for i, (x, y) in enumerate(train_loader):
                 n = x.size(0)
                 data_time += time.time() - data_start
-                model.train()
+                mohyper_netdel.train()
                 step += 1
 
                 x = x.to(self.device)
@@ -149,7 +158,7 @@ class Diffusion(object):
                     low=0, high=self.num_timesteps, size=(n // 2 + 1,)
                 ).to(self.device)
                 t = torch.cat([t, self.num_timesteps - t - 1], dim=0)[:n]
-                loss = loss_registry[config.model.type](model, x, t, e, b)
+                loss = loss_registry[config.model.type](model, hyper_net, x, t, e, b)
 
                 tb_logger.add_scalar("loss", loss, global_step=step)
 
@@ -162,18 +171,18 @@ class Diffusion(object):
 
                 try:
                     torch.nn.utils.clip_grad_norm_(
-                        model.parameters(), config.optim.grad_clip
+                        hyper_net.parameters(), config.optim.grad_clip
                     )
                 except Exception:
                     pass
                 optimizer.step()
 
                 if self.config.model.ema:
-                    ema_helper.update(model)
+                    ema_helper.update(hyper_net)
 
                 if step % self.config.training.snapshot_freq == 0 or step == 1:
                     states = [
-                        model.state_dict(),
+                        hyper_net.state_dict(),
                         optimizer.state_dict(),
                         epoch,
                         step,
@@ -192,6 +201,15 @@ class Diffusion(object):
     def sample(self):
         model = Model(self.config)
 
+
+        hyper_net = PermutationInvariantHyperNetwork(
+            dataset.dataset_size,
+            [32, 64, 96],
+            model,
+            use_outer_net=0,
+        )
+
+
         if not self.args.use_pretrained:
             if getattr(self.config.sampling, "ckpt_id", None) is None:
                 states = torch.load(
@@ -206,14 +224,16 @@ class Diffusion(object):
                     map_location=self.config.device,
                 )
             model = model.to(self.device)
+            hyper_net = hyper_net.to(self.device)
             model = torch.nn.DataParallel(model)
-            model.load_state_dict(states[0], strict=True)
+            hyper_net = torch.nn.DataParallel(hyper_net)
+            hyper_net.load_state_dict(states[0], strict=True)
 
             if self.config.model.ema:
                 ema_helper = EMAHelper(mu=self.config.model.ema_rate)
-                ema_helper.register(model)
+                ema_helper.register(hyper_net)
                 ema_helper.load_state_dict(states[-1])
-                ema_helper.ema(model)
+                ema_helper.ema(hyper_net)
             else:
                 ema_helper = None
         else:
@@ -230,18 +250,18 @@ class Diffusion(object):
             model.to(self.device)
             model = torch.nn.DataParallel(model)
 
-        model.eval()
+        hyper_net.eval()
 
         if self.args.fid:
-            self.sample_fid(model)
+            self.sample_fid(model, hyper_net)
         elif self.args.interpolation:
-            self.sample_interpolation(model)
+            self.sample_interpolation(model, hyper_net)
         elif self.args.sequence:
-            self.sample_sequence(model)
+            self.sample_sequence(model, hyper_net)
         else:
             raise NotImplementedError("Sample procedeure not defined")
 
-    def sample_fid(self, model):
+    def sample_fid(self, model, hyper_net):
         config = self.config
         img_id = len(glob.glob(f"{self.args.image_folder}/*"))
         print(f"starting from image {img_id}")
@@ -270,7 +290,7 @@ class Diffusion(object):
                     )
                     img_id += 1
 
-    def sample_sequence(self, model):
+    def sample_sequence(self, model, hyper_net):
         config = self.config
 
         x = torch.randn(
@@ -293,7 +313,7 @@ class Diffusion(object):
                     x[i][j], os.path.join(self.args.image_folder, f"{j}_{i}.png")
                 )
 
-    def sample_interpolation(self, model):
+    def sample_interpolation(self, model, hyper_net):
         config = self.config
 
         def slerp(z1, z2, alpha):
